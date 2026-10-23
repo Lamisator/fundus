@@ -1,0 +1,7 @@
+.git
+data
+pgdata
+backups
+.env
+*.md
+!README.md

@@ -1,0 +1,23 @@
+# Overlay for running Fundus behind an existing Traefik (external network
+# "proxy", entrypoint "websecure", certificate resolver "le"):
+#
+#   docker compose -f docker-compose.yml -f deploy/compose.traefik.yml up -d --build
+#
+# Set FUNDUS_HOST=kb.example.com in .env.
+
+services:
+  fundus:
+    ports: !reset []
+    networks: [internal, proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.fundus.rule=Host(`${FUNDUS_HOST:?set FUNDUS_HOST in .env}`)
+      - traefik.http.routers.fundus.entrypoints=websecure
+      - traefik.http.routers.fundus.tls=true
+      - traefik.http.routers.fundus.tls.certresolver=le
+      - traefik.http.services.fundus.loadbalancer.server.port=8080
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>{{.Entry.Title}} · {{.Site}}</title>
+  <link rel="icon" href="/static/img/logo.svg" type="image/svg+xml">
+  <script src="/static/js/theme.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/chroma.css">
+  <style>
+    .share-top { display: flex; align-items: center; gap: 10px; padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--surface); }
+    .share-top img { width: 24px; height: 24px; }
+    .share-top b { font-family: var(--font-display); font-size: 18px; font-weight: 600; }
+    .share-page { max-width: 820px; margin: 0 auto; padding: 24px 24px 64px; }
+    .share-props { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 20px; font-size: 13px; color: var(--muted); }
+    .share-props b { color: var(--text); font-weight: 550; }
+    .share-foot { margin-top: 48px; color: var(--faint); font-size: 12.5px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header class="share-top"><img src="/static/img/logo.svg" alt=""><b>{{.Site}}</b><span class="spacer"></span><span class="chip">Read-only shared entry</span></header>
+  <main class="share-page">
+    <header class="entry-head">
+      <div class="chips">
+        <span class="chip kind-chip" style="--c:{{.Kind.Color}}">{{.Kind.Label}}</span>
+        {{if .Entry.Status}}<span class="chip status status-{{.Entry.Status}}">{{.Entry.Status}}</span>{{end}}
+        {{range .Entry.Tags}}<span class="chip tag">{{.}}</span>{{end}}
+      </div>
+      <h1>{{.Entry.Title}}</h1>
+      {{if .Entry.Summary}}<p class="summary">{{.Entry.Summary}}</p>{{end}}
+      <div class="byline">Last updated {{date .Entry.UpdatedAt}}</div>
+    </header>
+    {{if .Fields}}<div class="share-props">{{range .Fields}}<span>{{index . 0}}: <b>{{index . 1}}</b></span>{{end}}</div>{{end}}
+    {{if .Entry.ErrorText}}<div class="error-block"><div class="lbl">Error message</div><pre>{{.Entry.ErrorText}}</pre></div>{{end}}
+    <div class="prose">{{.BodyHTML}}</div>
+    {{if .Solutions}}
+      <div class="solutions-head"><h2>Solutions</h2><span class="badge">{{len .Solutions}}</span></div>
+      {{range .Solutions}}
+        <div class="card solution{{if .Accepted}} accepted{{end}}">
+          <div class="solution-head">{{if .Accepted}}<span class="accepted-badge">✓ Accepted</span>{{end}}<b>{{.Title}}</b></div>
+          <div class="solution-body prose">{{.HTML}}</div>
+          <div class="solution-foot">{{if .Votes}}Worked for {{.Votes}} · {{end}}{{date .CreatedAt}}</div>
+        </div>
+      {{end}}
+    {{end}}
+    <p class="share-foot">Shared from {{.Site}}</p>
+  </main>
+</body>
+</html>

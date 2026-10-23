@@ -1,0 +1,2445 @@
+openapi: 3.1.0
+info:
+  title: Fundus API
+  version: "1"
+  license:
+    name: MIT
+  description: |
+    Fundus is a general-purpose knowledge base, built first of all for documenting IT problems and their solutions. Everything the web UI does goes through this REST API, so scripts, CI jobs, chat bots and AI assistants can search and add knowledge just like a person can. All endpoints live under `/api/v1`, take and return JSON (UTF-8) and use ISO 8601 timestamps.
+
+    ## Quick start
+
+    Create an API token under **Settings → API tokens**, then document a solved problem together with its fix in one call:
+
+    ```
+    export FUNDUS_TOKEN=fdk_...
+    curl -X POST https://kb.example.com/api/v1/entries \
+      -H "Authorization: Bearer $FUNDUS_TOKEN" -H "Content-Type: application/json" \
+      -d '{"kind":"problem","title":"nginx: 413 Request Entity Too Large on uploads",
+           "error_text":"413 Request Entity Too Large","tags":["nginx","uploads"],
+           "fields":{"software":"nginx","version":"1.27.2"},
+           "solutions":[{"title":"Raise client_max_body_size","body":"Set `client_max_body_size 100m;` and reload nginx.","accepted":true}]}'
+    ```
+
+    Search for it, with facet counts:
+
+    ```
+    curl -G https://kb.example.com/api/v1/search \
+      -H "Authorization: Bearer $FUNDUS_TOKEN" \
+      --data-urlencode 'q=request entity too large' --data-urlencode 'kind=problem'
+    ```
+
+    ## Authentication
+
+    There are two ways to authenticate:
+
+    - **Browser sessions** — the web UI signs in with a passkey, SSO (OpenID Connect, e.g. Zitadel) or username and password and receives the HttpOnly cookie `fundus_session`.
+    - **API tokens** — send `Authorization: Bearer fdk_…`. Create tokens under **Settings → API tokens**; the secret is shown only once and only its hash is stored. Tokens can expire.
+
+    Every token carries scopes: `read` (always), `write` and `admin`. A request is allowed only if both the scope and the user's role permit it:
+
+    | Action | Role needed | Token scope needed |
+    | --- | --- | --- |
+    | Read entries, search, vote, star | viewer, editor or admin | `read` |
+    | Create, edit, delete entries and solutions | editor or admin | `write` |
+    | Users, spaces, kinds, webhooks, import, purge | admin | `admin` |
+
+    Account-security endpoints (passwords, passkeys, sessions, tokens) are only available to browser sessions, never to tokens.
+
+    **CSRF:** a cookie-authenticated request that changes something (POST, PUT, PATCH, DELETE) must be provably same-origin: a matching `Origin` header, an `X-Requested-With` header, or a JSON body. Requests with a bearer token are exempt.
+
+    ## Errors and versions
+
+    Errors always have the same shape, with a stable machine-readable `code`:
+
+    ```
+    {"error": {"code": "not_found", "message": "not found"}}
+    ```
+
+    | HTTP | code | Meaning |
+    | --- | --- | --- |
+    | 400 | `bad_request` | Invalid JSON or a failed validation; the message says which field |
+    | 401 | `unauthenticated` / `invalid_token` | No credentials, or the token is invalid, expired or revoked |
+    | 401 | `bad_credentials` | Wrong username, password or passkey |
+    | 403 | `forbidden` / `csrf` | Role or scope too low, or a cross-site write |
+    | 404 | `not_found` | No such resource (or no such endpoint) |
+    | 409 | `conflict` / `version_conflict` / `in_use` | Duplicate, concurrent edit, or still referenced |
+    | 413 | `too_large` | Upload over the configured limit |
+    | 429 | `rate_limited` | Too many failed sign-in attempts |
+    | 500 | `internal` | Server error; details are in the server log |
+
+    **Optimistic locking:** every entry has a `version` that increases with each edit. Send the version you based your edit on in `PATCH /api/v1/entries/{id}`; if someone else saved in between you get `409 version_conflict` instead of silently overwriting their work. Omit `version` to force the update. Every version is kept and can be viewed, diffed and restored.
+
+    **Pagination:** list endpoints take `limit` (default 25, max 200) and `offset` and return `total`, the number of matches across all pages.
+
+    ## Search syntax
+
+    `GET /api/v1/search` and `GET /api/v1/entries?q=` search titles, summaries, bodies, error messages, field values, tags and solutions, ranked by relevance:
+
+    - Words are combined with AND and match English word forms (`crashes` finds `crash`).
+    - The last word also matches as a prefix, so search-as-you-type works (`postgr` finds `postgres`).
+    - `"quoted phrases"` must appear as written, `-word` excludes, `or` combines alternatives.
+    - Titles also match fuzzily (typos), and error messages match as substrings.
+    - Long inputs such as a pasted log line match on any of their words, so pasting a whole error usually finds the entry that documents it.
+
+    Results carry a highlighted `snippet` (matches wrapped in `<mark>`, the rest HTML-escaped) and a `rank`. With `facets=1` (the default on `/search`) the response also counts matches per kind, status, space and tag; each dimension is counted with all other filters applied, so the counts show what selecting that value would return.
+
+    ## Webhooks
+
+    Admins can register webhooks (`/api/v1/webhooks`). Fundus then POSTs JSON for these events: `entry.created`, `entry.updated`, `entry.deleted`, `solution.created`, `solution.accepted` (or `*` for all). The test button sends `ping`.
+
+    ```
+    POST https://chat.example.com/hooks/fundus
+    Content-Type: application/json
+    X-Fundus-Event: entry.created
+    X-Fundus-Signature: sha256=5d41402abc4b2a76b9719d911017c592...
+
+    {"event": "entry.created", "at": "2026-10-23T10:49:34Z", "data": {"id": 42, "title": "..."}}
+    ```
+
+    Verify `X-Fundus-Signature` by computing the hex HMAC-SHA256 of the raw body with the webhook's secret. Deliveries time out after 10 seconds and are retried twice on network errors and 5xx responses; the latest result is shown in the admin UI.
+
+    ## MCP for AI assistants
+
+    `POST /mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server (streamable HTTP transport, JSON responses, no SSE stream). It authenticates with an API token, so an assistant acts with that token's scopes. Tools:
+
+    - `search_knowledge` — full-text search, also with pasted error messages
+    - `get_entry` — one entry as Markdown with all solutions
+    - `find_similar` — duplicate check by title and/or error text
+    - `list_taxonomy` — kinds, spaces and popular tags
+    - `create_entry`, `update_entry`, `add_solution` — only with a `write` token
+
+    Connect Claude Code:
+
+    ```
+    claude mcp add --transport http fundus https://kb.example.com/mcp \
+      --header "Authorization: Bearer fdk_..."
+    ```
+
+tags:
+  - name: Entries
+    description: The records of the knowledge base — problems, how-tos, runbooks, snippets, notes, references or any custom kind.
+  - name: Search
+    description: Full-text search, facets and duplicate detection.
+  - name: Solutions
+    description: Answers attached to an entry (for kinds with solutions, such as problems), with "worked for me" votes and one accepted solution.
+  - name: Links
+    description: Typed relations between entries. `[[id]]` mentions in bodies show up as backlinks automatically.
+  - name: Revisions
+    description: Every saved version of an entry, for history, diffs and restores.
+  - name: Attachments
+    description: Files and images referenced from entry bodies.
+  - name: Sharing
+    description: Public read-only links for single entries.
+  - name: Taxonomy
+    description: Kinds, spaces and tags.
+  - name: Account
+    description: The signed-in user's profile, sign-in methods, sessions and API tokens.
+  - name: Authentication
+    description: Sign-in flows (password, passkeys, OpenID Connect) and first-run setup.
+  - name: Administration
+    description: Users, webhooks and the audit log. Admin only.
+  - name: Data
+    description: Statistics, export and import.
+  - name: MCP
+    description: Model Context Protocol endpoint for AI assistants.
+  - name: System
+    description: Health check, API description and public pages.
+
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+
+paths:
+  # ------------------------------------------------------------ entries
+  /api/v1/entries:
+    get:
+      tags: [Entries]
+      summary: List or search entries
+      description: |
+        Lists live entries, newest change first (pinned entries first). With `q` this is a full-text search ranked by relevance, see "Search syntax". All filters combine with AND.
+      operationId: listEntries
+      parameters:
+        - $ref: '#/components/parameters/Q'
+        - $ref: '#/components/parameters/Kind'
+        - $ref: '#/components/parameters/Space'
+        - $ref: '#/components/parameters/Status'
+        - $ref: '#/components/parameters/Tag'
+        - $ref: '#/components/parameters/Starred'
+        - $ref: '#/components/parameters/Author'
+        - $ref: '#/components/parameters/Pinned'
+        - name: trash
+          in: query
+          description: List entries in the trash instead (editors only).
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+        - name: facets
+          in: query
+          description: Include facet counts.
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: A page of entries. Bodies and error texts are omitted in listings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Entries]
+      summary: Create an entry
+      description: |
+        Creates an entry and its first revision. `kind` defaults to `note`; `status` defaults to the kind's first status. Solutions and links can be created in the same call (all or nothing for solutions). Uploads referenced as `/files/<id>` in the body are attached to the new entry.
+      operationId: createEntry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEntryInput' }
+            example:
+              kind: problem
+              title: "Docker: permission denied on /var/run/docker.sock"
+              summary: Running docker as a normal user fails right after installing Docker CE.
+              body: |
+                ## Symptoms
+
+                Every `docker` command fails unless run with `sudo`.
+
+                ## Root cause
+
+                The user is not in the `docker` group, which owns the socket.
+              error_text: "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
+              status: open
+              tags: [docker, linux, permissions]
+              fields: { os: Debian 13, software: Docker CE, version: "29.0" }
+              space_id: 1
+              solutions:
+                - title: Add the user to the docker group
+                  body: "`sudo usermod -aG docker $USER`, then log out and back in (or run `newgrp docker`)."
+                  accepted: true
+              links:
+                - { to: 12, rel: related }
+      responses:
+        '201':
+          description: The created entry.
+          headers:
+            Location:
+              description: URL of the new entry.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/entries/{id}:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Entries]
+      summary: Get an entry
+      description: Returns the entry with its Markdown `body` and rendered, sanitised `body_html`. Use `expand` to embed related data in one request. Trashed entries are visible to editors only.
+      operationId: getEntry
+      parameters:
+        - name: expand
+          in: query
+          description: Comma-separated list of `solutions`, `links`, `attachments`, `shares` (editors only), or `all`.
+          schema: { type: string, example: "solutions,links" }
+        - name: render
+          in: query
+          description: Set to `false` to skip rendering `body_html`.
+          schema: { type: boolean, default: true }
+        - name: count_view
+          in: query
+          description: Count this request as a page view (the web UI sets it).
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: The entry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntryDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Entries]
+      summary: Update an entry
+      description: |
+        Changes only the fields present in the body and records a new revision. Send `version` to guard against concurrent edits (`409 version_conflict`). `space_id: 0` removes the entry from its space. Changing `kind` resets a status the new kind does not know to its default.
+      operationId: updateEntry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EntryInput' }
+            example:
+              status: solved
+              tags: [docker, linux, permissions, groups]
+              version: 3
+              note: Added root cause
+      responses:
+        '200':
+          description: The updated entry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Entries]
+      summary: Trash or purge an entry
+      description: Moves the entry to the trash. With `purge=true` (admins only) it is deleted for good, including history, solutions and links.
+      operationId: deleteEntry
+      parameters:
+        - name: purge
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '204': { description: 'Trashed or purged.' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/entries/{id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    post:
+      tags: [Entries]
+      summary: Restore an entry from the trash
+      operationId: restoreEntry
+      responses:
+        '200':
+          description: The restored entry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/entries/{id}/pin:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    put:
+      tags: [Entries]
+      summary: Pin an entry
+      description: Pinned entries are listed first and shown on the home page. Pinning does not create a revision.
+      operationId: pinEntry
+      responses:
+        '204': { description: 'Pinned.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Entries]
+      summary: Unpin an entry
+      operationId: unpinEntry
+      responses:
+        '204': { description: 'Unpinned.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/entries/{id}/star:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    put:
+      tags: [Entries]
+      summary: Star an entry
+      description: Stars are personal bookmarks; filter with `starred=1`. Viewers may star too.
+      operationId: starEntry
+      responses:
+        '204': { description: 'Starred.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Entries]
+      summary: Unstar an entry
+      operationId: unstarEntry
+      responses:
+        '204': { description: 'Unstarred.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/entries/{id}/markdown:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Entries]
+      summary: Export an entry as Markdown
+      description: The entry as one Markdown document with YAML front matter (id, kind, status, tags, fields, dates…), the error message as a code block and every solution as a section.
+      operationId: entryMarkdown
+      parameters:
+        - name: download
+          in: query
+          description: 'Send `Content-Disposition: attachment`.'
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Markdown text.
+          content:
+            text/markdown:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------ search
+  /api/v1/search:
+    get:
+      tags: [Search]
+      summary: Search entries with facets
+      description: Same as `GET /api/v1/entries` but facets are on by default and the trash is never searched.
+      operationId: search
+      parameters:
+        - $ref: '#/components/parameters/Q'
+        - $ref: '#/components/parameters/Kind'
+        - $ref: '#/components/parameters/Space'
+        - $ref: '#/components/parameters/Status'
+        - $ref: '#/components/parameters/Tag'
+        - $ref: '#/components/parameters/Starred'
+        - $ref: '#/components/parameters/Author'
+        - $ref: '#/components/parameters/Pinned'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+        - name: facets
+          in: query
+          schema: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Search results.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResult' }
+
+  /api/v1/similar:
+    get:
+      tags: [Search]
+      summary: Find similar entries
+      description: Fuzzy match on title, error text and shared tags — use it before creating an entry to avoid duplicates. Each result's `rank` is a similarity score; weak matches are left out.
+      operationId: similar
+      parameters:
+        - name: title
+          in: query
+          schema: { type: string, example: "nginx 413 request entity too large" }
+        - name: error
+          in: query
+          description: An error message.
+          schema: { type: string }
+        - name: tag
+          in: query
+          description: Tags (repeatable or comma-separated).
+          style: form
+          explode: true
+          schema: { type: array, items: { type: string } }
+        - name: exclude
+          in: query
+          description: Entry id to leave out (the one being edited).
+          schema: { type: integer }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 5, maximum: 20 }
+      responses:
+        '200':
+          description: Similar entries, best first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Entry' }
+
+  /api/v1/entries/{id}/similar:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Search]
+      summary: Find entries similar to an entry
+      operationId: entrySimilar
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 5, maximum: 20 }
+      responses:
+        '200':
+          description: Similar entries, best first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Entry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/render:
+    post:
+      tags: [Search]
+      summary: Render Markdown
+      description: Renders Markdown to the same sanitised HTML used for entries (GitHub-flavoured Markdown, syntax highlighting, `[[id]]` links). Used by the editor preview.
+      operationId: render
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                markdown: { type: string, example: "Run `nginx -t` first, see [[12]]." }
+      responses:
+        '200':
+          description: Rendered HTML.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  html: { type: string }
+
+  # ------------------------------------------------------------ solutions
+  /api/v1/entries/{id}/solutions:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Solutions]
+      summary: List an entry's solutions
+      description: Accepted solution first, then by "worked for me" votes.
+      operationId: listSolutions
+      responses:
+        '200':
+          description: Solutions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Solution' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Solutions]
+      summary: Add a solution
+      description: >-
+        With `accepted: true` it becomes the accepted solution, and an `open` or `investigating` problem is set to `solved`.
+      operationId: createSolution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SolutionInput' }
+            example:
+              title: Raise client_max_body_size
+              body: "Add `client_max_body_size 100m;` to the `server` block, then `nginx -t && systemctl reload nginx`."
+              accepted: true
+      responses:
+        '201':
+          description: The new solution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Solution' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/solutions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SolutionId'
+    patch:
+      tags: [Solutions]
+      summary: Edit a solution
+      operationId: updateSolution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                body: { type: string, description: 'Markdown; must not be empty.' }
+      responses:
+        '200':
+          description: The updated solution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Solution' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Solutions]
+      summary: Delete a solution
+      operationId: deleteSolution
+      responses:
+        '204': { description: 'Deleted.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/solutions/{id}/accept:
+    parameters:
+      - $ref: '#/components/parameters/SolutionId'
+    put:
+      tags: [Solutions]
+      summary: Accept a solution
+      description: Only one solution per entry is accepted; accepting another moves the mark. An open problem becomes `solved`.
+      operationId: acceptSolution
+      responses:
+        '204': { description: 'Accepted.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Solutions]
+      summary: Unaccept a solution
+      operationId: unacceptSolution
+      responses:
+        '204': { description: 'No longer accepted.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/solutions/{id}/vote:
+    parameters:
+      - $ref: '#/components/parameters/SolutionId'
+    put:
+      tags: [Solutions]
+      summary: Vote "worked for me"
+      operationId: voteSolution
+      responses:
+        '200':
+          description: The new vote count.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VoteResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Solutions]
+      summary: Withdraw a vote
+      operationId: unvoteSolution
+      responses:
+        '200':
+          description: The new vote count.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VoteResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------ links
+  /api/v1/entries/{id}/links:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Links]
+      summary: List links
+      description: Outgoing and incoming typed links plus `mentioned-by` backlinks from `[[id]]` references in other entries.
+      operationId: listLinks
+      responses:
+        '200':
+          description: Links.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Link' }
+    post:
+      tags: [Links]
+      summary: Add a link
+      operationId: addLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to: { type: integer, description: 'Target entry id.', example: 12 }
+                rel: { $ref: '#/components/schemas/LinkRel' }
+      responses:
+        '201':
+          description: All links of the entry after the change.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Link' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    delete:
+      tags: [Links]
+      summary: Remove a link
+      description: Removes the link between the two entries in either direction.
+      operationId: deleteLink
+      parameters:
+        - name: to
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: rel
+          in: query
+          schema: { $ref: '#/components/schemas/LinkRel' }
+      responses:
+        '204': { description: 'Removed.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------ revisions
+  /api/v1/entries/{id}/revisions:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Revisions]
+      summary: List revisions
+      description: Newest first. Bodies are omitted; fetch a single revision for its content.
+      operationId: listRevisions
+      responses:
+        '200':
+          description: Revisions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Revision' }
+
+  /api/v1/entries/{id}/revisions/{version}:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+      - $ref: '#/components/parameters/Version'
+    get:
+      tags: [Revisions]
+      summary: Get a revision
+      operationId: getRevision
+      responses:
+        '200':
+          description: The full state of the entry at that version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Revision' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/entries/{id}/revisions/{version}/restore:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+      - $ref: '#/components/parameters/Version'
+    post:
+      tags: [Revisions]
+      summary: Restore a revision
+      description: Saves the content of that version as a new version; nothing is lost.
+      operationId: restoreRevision
+      responses:
+        '200':
+          description: The entry after the restore.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------ attachments
+  /api/v1/attachments:
+    post:
+      tags: [Attachments]
+      summary: Upload a file
+      description: |
+        Upload as `multipart/form-data`. Reference the returned `url` in Markdown (`![](/files/…)`). Uploads without `entry_id` are attached to the entry that first references them when it is saved; uploads never referenced are deleted after a day.
+      operationId: upload
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                entry_id: { type: integer, description: 'Attach to this entry right away.' }
+      responses:
+        '201':
+          description: The stored file.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Attachment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '413':
+          description: File too large.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/attachments/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Attachments]
+      summary: Delete a file
+      operationId: deleteAttachment
+      responses:
+        '204': { description: 'Deleted.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/entries/{id}/attachments:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Attachments]
+      summary: List an entry's files
+      operationId: listAttachments
+      responses:
+        '200':
+          description: Attachments.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Attachment' }
+
+  /files/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+      - $ref: '#/components/parameters/ShareQuery'
+    get:
+      tags: [Attachments]
+      summary: Download a file
+      description: Images, video, audio, PDF and plain text are shown inline; everything else (including SVG) downloads. Needs a session or token — or a share token of the entry the file belongs to.
+      operationId: getFile
+      security: []
+      responses:
+        '200':
+          description: The file.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { description: 'Not signed in and no valid share token.' }
+        '404': { description: 'No such file.' }
+
+  /files/{id}/{name}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: name
+        in: path
+        required: true
+        description: The file name; cosmetic, ignored by the server.
+        schema: { type: string }
+      - $ref: '#/components/parameters/ShareQuery'
+    get:
+      tags: [Attachments]
+      summary: Download a file (with file name)
+      description: 'Same as `/files/{id}`; the URL form returned by the API.'
+      operationId: getFileNamed
+      security: []
+      responses:
+        '200':
+          description: The file.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { description: 'Not signed in and no valid share token.' }
+        '404': { description: 'No such file.' }
+
+  # ------------------------------------------------------------ sharing
+  /api/v1/entries/{id}/shares:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    get:
+      tags: [Sharing]
+      summary: List share links
+      operationId: listShares
+      responses:
+        '200':
+          description: Active and expired share links.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Share' }
+    post:
+      tags: [Sharing]
+      summary: Create a share link
+      description: 'Anyone with the link can read the entry and its solutions at `/s/{token}` without signing in. The body is optional.'
+      operationId: createShare
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expires_in_days: { type: integer, description: '0 or absent = never expires.', example: 7 }
+      responses:
+        '201':
+          description: The share link.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Share' }
+
+  /api/v1/entries/{id}/shares/{token}:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+      - name: token
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Sharing]
+      summary: Revoke a share link
+      operationId: deleteShare
+      responses:
+        '204': { description: 'Revoked.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /s/{token}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Sharing]
+      summary: Public share page
+      description: Read-only HTML page for a share link. Each visit is counted.
+      operationId: sharePage
+      security: []
+      responses:
+        '200':
+          description: HTML page.
+          content:
+            text/html:
+              schema: { type: string }
+        '404': { description: 'Invalid or expired link.' }
+
+  # ------------------------------------------------------------ taxonomy
+  /api/v1/tags:
+    get:
+      tags: [Taxonomy]
+      summary: List tags
+      description: Tags in use with their entry counts, most used first.
+      operationId: listTags
+      parameters:
+        - name: prefix
+          in: query
+          description: Only tags starting with this (autocomplete).
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 500, maximum: 1000 }
+      responses:
+        '200':
+          description: Tags.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Count' }
+
+  /api/v1/tags/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [Taxonomy]
+      summary: Rename or merge a tag
+      description: Renames the tag on every entry. If the new name already exists the two tags are merged. Editors may do this.
+      operationId: renameTag
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, example: kubernetes }
+      responses:
+        '200':
+          description: The normalised new name and the number of entries changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  entries: { type: integer }
+    delete:
+      tags: [Taxonomy]
+      summary: Remove a tag everywhere
+      description: Admin only.
+      operationId: deleteTag
+      responses:
+        '200':
+          description: Number of entries changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries: { type: integer }
+
+  /api/v1/spaces:
+    get:
+      tags: [Taxonomy]
+      summary: List spaces
+      operationId: listSpaces
+      responses:
+        '200':
+          description: Spaces with entry counts.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Space' }
+    post:
+      tags: [Taxonomy]
+      summary: Create a space
+      description: Admin only. The slug is derived from the name when omitted.
+      operationId: createSpace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SpaceInput' }
+      responses:
+        '201':
+          description: The new space.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Space' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/spaces/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Space id or slug.
+        schema: { type: string }
+    get:
+      tags: [Taxonomy]
+      summary: Get a space
+      operationId: getSpace
+      responses:
+        '200':
+          description: The space.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Space' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Taxonomy]
+      summary: Update a space
+      description: Admin only. Only given fields change.
+      operationId: updateSpace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SpaceInput' }
+      responses:
+        '200':
+          description: The updated space.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Space' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Taxonomy]
+      summary: Delete a space
+      description: Admin only. Its entries are kept without a space.
+      operationId: deleteSpace
+      responses:
+        '204': { description: 'Deleted.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/kinds:
+    get:
+      tags: [Taxonomy]
+      summary: List kinds
+      operationId: listKinds
+      responses:
+        '200':
+          description: Kinds in display order.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Kind' }
+
+  /api/v1/kinds/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z][a-z0-9_\-]{0,31}$', example: incident }
+    put:
+      tags: [Taxonomy]
+      summary: Create or replace a kind
+      description: Admin only. The key comes from the path.
+      operationId: putKind
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Kind' }
+            example:
+              label: Incident
+              plural: Incidents
+              icon: alert
+              color: '#e5484d'
+              description: Outages and their post-mortems.
+              statuses: [ongoing, mitigated, resolved]
+              has_solutions: true
+              fields: [{ key: service, label: Service, placeholder: "api, db …" }]
+              template: "## Impact\n\n## Timeline\n\n## Root cause\n"
+              sort: 15
+      responses:
+        '200':
+          description: The saved kind.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Kind' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    delete:
+      tags: [Taxonomy]
+      summary: Delete a kind
+      description: Admin only; fails with `409 in_use` while entries of this kind exist (including the trash).
+      operationId: deleteKind
+      responses:
+        '204': { description: 'Deleted.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ------------------------------------------------------------ account
+  /api/v1/me:
+    get:
+      tags: [Account]
+      summary: Who am I
+      operationId: getMe
+      responses:
+        '200':
+          description: The caller and what they may do.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Account]
+      summary: Update my profile
+      operationId: updateMe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                email: { type: string, format: email }
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /api/v1/me/password:
+    post:
+      tags: [Account]
+      summary: Change, set or remove my password
+      description: Browser sessions only. `current` is required when a password exists. An empty `new` removes the password, which is allowed only if you have a passkey or linked SSO.
+      operationId: changePassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                current: { type: string }
+                new: { type: string, minLength: 10, maxLength: 72 }
+      responses:
+        '204': { description: 'Saved.' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/me/sessions:
+    get:
+      tags: [Account]
+      summary: List my sessions
+      description: Browser sessions only.
+      operationId: listSessions
+      responses:
+        '200':
+          description: Active sessions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Session' }
+
+  /api/v1/me/sessions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The 16-character session id from the list.
+        schema: { type: string }
+    delete:
+      tags: [Account]
+      summary: Sign out a session
+      operationId: revokeSession
+      responses:
+        '204': { description: 'Signed out.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/me/tokens:
+    get:
+      tags: [Account]
+      summary: List my API tokens
+      description: Browser sessions only. Secrets are never shown again; only a prefix.
+      operationId: listTokens
+      responses:
+        '200':
+          description: Tokens.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/APIToken' }
+    post:
+      tags: [Account]
+      summary: Create an API token
+      description: Browser sessions only. `read` is always included; `write` needs the editor role, `admin` the admin role. The response contains the secret `token` — the only time it is shown.
+      operationId: createToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 100, example: Claude Code }
+                scopes:
+                  type: array
+                  items: { type: string, enum: [read, write, admin] }
+                  example: [read, write]
+                expires_in_days: { type: integer, description: '0 = never.', example: 90 }
+      responses:
+        '201':
+          description: The new token including its secret.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/APIToken' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/me/tokens/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      tags: [Account]
+      summary: Revoke an API token
+      operationId: deleteToken
+      responses:
+        '204': { description: 'Revoked.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/me/passkeys:
+    get:
+      tags: [Account]
+      summary: List my passkeys
+      operationId: listPasskeys
+      responses:
+        '200':
+          description: Passkeys.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Passkey' }
+
+  /api/v1/me/passkeys/begin:
+    post:
+      tags: [Account]
+      summary: Start passkey registration
+      description: Returns WebAuthn `PublicKeyCredentialCreationOptions` (binary fields base64url-encoded) and sets a short-lived ceremony cookie. Resident keys are required so the passkey works for usernameless sign-in.
+      operationId: passkeyRegisterBegin
+      responses:
+        '200':
+          description: Creation options for `navigator.credentials.create()`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebAuthnOptions' }
+
+  /api/v1/me/passkeys/finish:
+    post:
+      tags: [Account]
+      summary: Finish passkey registration
+      description: Send the credential returned by the browser, binary fields base64url-encoded. The passkey name goes in the query string because the body is the raw WebAuthn response.
+      operationId: passkeyRegisterFinish
+      parameters:
+        - name: name
+          in: query
+          schema: { type: string, maxLength: 80, example: MacBook Touch ID }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebAuthnCredential' }
+      responses:
+        '201':
+          description: Registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  name: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/me/passkeys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [Account]
+      summary: Rename a passkey
+      operationId: renamePasskey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 80 }
+      responses:
+        '204': { description: 'Renamed.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Account]
+      summary: Remove a passkey
+      description: Refused if it is your only way to sign in.
+      operationId: deletePasskey
+      responses:
+        '204': { description: 'Removed.' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/me/sso:
+    delete:
+      tags: [Account]
+      summary: Unlink SSO
+      description: Refused unless you have a password or a passkey. To link, open `/auth/oidc/login?link=1` while signed in.
+      operationId: unlinkSSO
+      responses:
+        '204': { description: 'Unlinked.' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  # ------------------------------------------------------------ authentication
+  /api/v1/auth/config:
+    get:
+      tags: [Authentication]
+      summary: Get sign-in options
+      description: Tells the login screen which methods are available and whether first-run setup is pending.
+      operationId: authConfig
+      security: []
+      responses:
+        '200':
+          description: Configuration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthConfig' }
+
+  /api/v1/auth/setup:
+    post:
+      tags: [Authentication]
+      summary: Create the first admin
+      description: Only while no user exists. The setup token is printed in the server log on first start (unless FUNDUS_ADMIN_USER/PASSWORD created an admin). Signs the new admin in.
+      operationId: setup
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [setup_token, username, password]
+              properties:
+                setup_token: { type: string }
+                username: { type: string }
+                display_name: { type: string }
+                password: { type: string, minLength: 10 }
+      responses:
+        '201':
+          description: The admin user; a session cookie is set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Sign in with username and password
+      description: Sets the `fundus_session` cookie. Rate limited per IP and username. Disabled when FUNDUS_PASSWORD_LOGIN=false.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Sign out
+      operationId: logout
+      security: []
+      responses:
+        '204': { description: 'Signed out; the cookie is cleared.' }
+
+  /api/v1/auth/passkey/begin:
+    post:
+      tags: [Authentication]
+      summary: Start passkey sign-in
+      description: Usernameless (discoverable credential) sign-in. Returns `PublicKeyCredentialRequestOptions` and sets a ceremony cookie valid for five minutes.
+      operationId: passkeyLoginBegin
+      security: []
+      responses:
+        '200':
+          description: Request options for `navigator.credentials.get()`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebAuthnOptions' }
+
+  /api/v1/auth/passkey/finish:
+    post:
+      tags: [Authentication]
+      summary: Finish passkey sign-in
+      operationId: passkeyLoginFinish
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebAuthnCredential' }
+      responses:
+        '200':
+          description: Signed in; a session cookie is set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/oidc/login:
+    get:
+      tags: [Authentication]
+      summary: Start SSO sign-in (browser)
+      description: Redirects to the OpenID Connect provider (auth-code flow with PKCE). With `link=1` and a signed-in session, the identity is linked to the current account instead.
+      operationId: oidcLogin
+      security: []
+      parameters:
+        - name: link
+          in: query
+          schema: { type: string, enum: ['1'] }
+        - name: return
+          in: query
+          description: Local path to land on after sign-in.
+          schema: { type: string, example: /e/42 }
+        - name: prompt
+          in: query
+          schema: { type: string, enum: [login, select_account] }
+      responses:
+        '302': { description: 'Redirect to the identity provider.' }
+        '404': { description: 'SSO is not configured.' }
+
+  /auth/oidc/callback:
+    get:
+      tags: [Authentication]
+      summary: SSO callback (browser)
+      description: Redirect target registered with the identity provider (`<base URL>/auth/oidc/callback`). Verifies state, nonce and ID token, links or provisions the user, sets the session cookie and redirects into the app. Errors redirect to `/login?error=…`.
+      operationId: oidcCallback
+      security: []
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        '302': { description: 'Redirect into the app or back to the login page.' }
+
+  # ------------------------------------------------------------ administration
+  /api/v1/users:
+    get:
+      tags: [Administration]
+      summary: List users
+      operationId: listUsers
+      responses:
+        '200':
+          description: All users.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/User' }
+    post:
+      tags: [Administration]
+      summary: Create a user
+      description: Without a password the user signs in via SSO (linked on first sign-in by matching username or verified e-mail) or a passkey added later.
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string, example: jdoe }
+                display_name: { type: string, example: Jane Doe }
+                email: { type: string, format: email }
+                role: { $ref: '#/components/schemas/Role' }
+                password: { type: string, minLength: 10 }
+      responses:
+        '201':
+          description: The new user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    patch:
+      tags: [Administration]
+      summary: Update a user
+      description: Disabling a user signs them out everywhere. The last admin cannot be demoted or disabled.
+      operationId: updateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                email: { type: string }
+                role: { $ref: '#/components/schemas/Role' }
+                disabled: { type: boolean }
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    delete:
+      tags: [Administration]
+      summary: Delete a user
+      description: Their entries stay but lose the author. You cannot delete yourself or the last admin.
+      operationId: deleteUser
+      responses:
+        '204': { description: 'Deleted.' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/users/{id}/password:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    post:
+      tags: [Administration]
+      summary: Set a user's password
+      description: An empty password removes it. The user is signed out everywhere.
+      operationId: setUserPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password: { type: string }
+      responses:
+        '204': { description: 'Saved.' }
+
+  /api/v1/audit:
+    get:
+      tags: [Administration]
+      summary: Read the audit log
+      description: Sign-ins (and failures), account changes, deletions, imports and more, newest first.
+      operationId: audit
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Events.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEvent' }
+
+  /api/v1/webhooks:
+    get:
+      tags: [Administration]
+      summary: List webhooks
+      operationId: listWebhooks
+      responses:
+        '200':
+          description: Webhooks including their secrets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Webhook' }
+    post:
+      tags: [Administration]
+      summary: Create a webhook
+      description: A signing secret is generated when none is given.
+      operationId: createWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri, example: "https://chat.example.com/hooks/fundus" }
+                events:
+                  type: array
+                  items: { $ref: '#/components/schemas/WebhookEvent' }
+                  example: [entry.created, solution.accepted]
+                secret: { type: string }
+      responses:
+        '201':
+          description: The webhook.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Webhook' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    patch:
+      tags: [Administration]
+      summary: Update a webhook
+      operationId: updateWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string, format: uri }
+                events:
+                  type: array
+                  items: { $ref: '#/components/schemas/WebhookEvent' }
+                active: { type: boolean }
+      responses:
+        '200':
+          description: The webhook.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Webhook' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Administration]
+      summary: Delete a webhook
+      operationId: deleteWebhook
+      responses:
+        '204': { description: 'Deleted.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/webhooks/{id}/test:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    post:
+      tags: [Administration]
+      summary: Send a test event
+      description: Delivers a `ping` event synchronously and returns the HTTP status or error.
+      operationId: testWebhook
+      responses:
+        '200':
+          description: Delivery result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "200" }
+
+  # ------------------------------------------------------------ data
+  /api/v1/stats:
+    get:
+      tags: [Data]
+      summary: Get statistics
+      operationId: stats
+      responses:
+        '200':
+          description: Counters and the activity of the last year.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stats' }
+
+  /api/v1/export:
+    get:
+      tags: [Data]
+      summary: Export everything
+      description: All live entries with solutions and links, plus kinds and spaces, as one JSON document. Attachments are not included.
+      operationId: export
+      responses:
+        '200':
+          description: Export document (sent as a download).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportDocument' }
+
+  /api/v1/import:
+    post:
+      tags: [Data]
+      summary: Import an export document
+      description: Admin only. Unknown kinds and spaces are created; entries are always added as new entries, and links and `[[id]]` references are re-mapped to the new ids. Up to 256 MiB.
+      operationId: import
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportDocument' }
+      responses:
+        '200':
+          description: Import summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported: { type: integer }
+                  ids:
+                    type: object
+                    description: Map of old id → new id.
+                    additionalProperties: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  # ------------------------------------------------------------ MCP
+  /mcp:
+    post:
+      tags: [MCP]
+      summary: MCP JSON-RPC endpoint
+      description: |
+        Model Context Protocol over streamable HTTP. Send one JSON-RPC 2.0 message per request: `initialize`, `ping`, `tools/list`, `tools/call`. Notifications (no `id`) are answered with 202. Requires an API token; write tools appear only for tokens with the `write` scope.
+      operationId: mcp
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JSONRPCRequest' }
+            example:
+              jsonrpc: "2.0"
+              id: 1
+              method: tools/call
+              params:
+                name: search_knowledge
+                arguments: { query: "permission denied docker.sock", limit: 5 }
+      responses:
+        '200':
+          description: 'JSON-RPC response. Tool failures come back as a result with `isError: true`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JSONRPCResponse' }
+        '202': { description: 'Notification accepted.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      tags: [MCP]
+      summary: SSE stream (not offered)
+      description: Always 405; this server only answers POSTed messages.
+      operationId: mcpGet
+      responses:
+        '405': { description: 'Method not allowed.' }
+
+  # ------------------------------------------------------------ system
+  /healthz:
+    get:
+      tags: [System]
+      summary: Health check
+      description: 200 when the database answers, 503 otherwise. Used by the Docker health check.
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  version: { type: string, example: 0.1.0 }
+        '503': { description: 'Database unreachable.' }
+
+  /api/openapi.json:
+    get:
+      tags: [System]
+      summary: This API description (JSON)
+      description: With `servers` set to this instance. CORS is open so external tools can load it.
+      operationId: openapiJSON
+      security: []
+      responses:
+        '200':
+          description: OpenAPI document.
+          content:
+            application/json:
+              schema: { type: object }
+
+  /api/openapi.yaml:
+    get:
+      tags: [System]
+      summary: This API description (YAML)
+      operationId: openapiYAML
+      security: []
+      responses:
+        '200':
+          description: OpenAPI document.
+          content:
+            application/yaml:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: An API token `fdk_…` from Settings → API tokens.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: fundus_session
+      description: Browser session cookie. Unsafe methods additionally need `X-Requested-With`, a same-origin `Origin` or a JSON body.
+
+  parameters:
+    EntryId:
+      name: id
+      in: path
+      required: true
+      description: Entry id.
+      schema: { type: integer, example: 42 }
+    SolutionId:
+      name: id
+      in: path
+      required: true
+      description: Solution id.
+      schema: { type: integer, example: 7 }
+    Version:
+      name: version
+      in: path
+      required: true
+      description: Revision number.
+      schema: { type: integer, example: 3 }
+    ShareQuery:
+      name: share
+      in: query
+      description: Share token, lets anonymous visitors of a share page load the entry's files.
+      schema: { type: string }
+    Q:
+      name: q
+      in: query
+      description: Search text, see "Search syntax". Up to 4000 characters.
+      schema: { type: string, example: "request entity too large" }
+    Kind:
+      name: kind
+      in: query
+      description: Kind key, e.g. `problem`.
+      schema: { type: string }
+    Space:
+      name: space
+      in: query
+      description: Space id, space slug, or `none` for entries without a space.
+      schema: { type: string, example: homelab }
+    Status:
+      name: status
+      in: query
+      schema: { type: string, example: open }
+    Tag:
+      name: tag
+      in: query
+      description: Tag filter; repeat the parameter or separate with commas. Entries must carry all given tags.
+      style: form
+      explode: true
+      schema:
+        type: array
+        items: { type: string }
+        example: [nginx, uploads]
+    Starred:
+      name: starred
+      in: query
+      description: Only entries starred by the caller.
+      schema: { type: boolean }
+    Author:
+      name: author
+      in: query
+      description: Only entries created by this user id.
+      schema: { type: integer }
+    Pinned:
+      name: pinned
+      in: query
+      schema: { type: boolean }
+    Sort:
+      name: sort
+      in: query
+      description: Default is relevance when searching, otherwise pinned first then recently updated.
+      schema: { type: string, enum: [relevance, updated, created, title, views] }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 25, minimum: 1, maximum: 200 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, default: 0, minimum: 0 }
+
+  responses:
+    BadRequest:
+      description: Invalid input.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: bad_request, message: "title is required" } }
+    Unauthorized:
+      description: Not authenticated.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: unauthenticated, message: "sign in or send an API token" } }
+    Forbidden:
+      description: Not allowed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: forbidden, message: "editor role and write scope required" } }
+    NotFound:
+      description: Not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: not_found, message: "not found" } }
+    Conflict:
+      description: Conflict.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: version_conflict, message: "the entry was changed by someone else (now at version 4); reload and merge" } }
+    RateLimited:
+      description: Too many failed attempts.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: not_found }
+            message: { type: string, example: not found }
+
+    Role:
+      type: string
+      enum: [admin, editor, viewer]
+
+    UserRef:
+      type: object
+      properties:
+        id: { type: integer, example: 1 }
+        username: { type: string, example: marius }
+        display_name: { type: string, example: Marius }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        display_name: { type: string }
+        email: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        disabled: { type: boolean }
+        has_password: { type: boolean }
+        sso: { type: boolean, description: 'Linked to the OpenID Connect provider.' }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: [string, 'null'], format: date-time }
+
+    Me:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        via: { type: string, enum: [session, token] }
+        scopes:
+          type: [array, 'null']
+          description: Token scopes; null for browser sessions.
+          items: { type: string }
+        passkeys: { type: integer }
+        can_edit: { type: boolean }
+        is_admin: { type: boolean }
+
+    AuthConfig:
+      type: object
+      properties:
+        site_name: { type: string, example: Fundus }
+        version: { type: string }
+        password_login: { type: boolean }
+        passkeys: { type: boolean }
+        oidc: { type: boolean }
+        oidc_label: { type: string, example: Sign in with Zitadel }
+        setup_required: { type: boolean }
+        authenticated: { type: boolean }
+
+    Entry:
+      type: object
+      properties:
+        id: { type: integer, example: 42 }
+        kind: { type: string, example: problem }
+        space_id: { type: [integer, 'null'], example: 1 }
+        title: { type: string, example: "nginx: 413 Request Entity Too Large on uploads" }
+        summary: { type: string, example: Uploads over 1 MB fail behind nginx. }
+        body: { type: string, description: 'Markdown. Omitted in listings.' }
+        body_html: { type: string, description: 'Rendered, sanitised HTML (detail requests only).' }
+        error_text: { type: string, description: 'Verbatim error message. Omitted in listings.', example: 413 Request Entity Too Large }
+        status: { type: string, description: 'One of the kind''s statuses, or empty.', example: solved }
+        tags:
+          type: array
+          items: { type: string }
+          example: [nginx, uploads]
+        fields:
+          type: object
+          additionalProperties: { type: string }
+          example: { software: nginx, version: 1.27.2, host: k-inf1 }
+        pinned: { type: boolean }
+        version: { type: integer, example: 3 }
+        view_count: { type: integer }
+        created_by: { oneOf: [{ $ref: '#/components/schemas/UserRef' }, { type: 'null' }] }
+        updated_by: { oneOf: [{ $ref: '#/components/schemas/UserRef' }, { type: 'null' }] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        deleted_at: { type: string, format: date-time, description: 'Set while in the trash.' }
+        solution_count: { type: integer }
+        has_accepted_solution: { type: boolean }
+        starred: { type: boolean, description: 'Starred by the caller.' }
+        snippet: { type: string, description: 'Search hit excerpt; HTML with matches in `<mark>`.' }
+        rank: { type: number, description: 'Relevance (search) or similarity score.' }
+
+    EntryDetail:
+      allOf:
+        - $ref: '#/components/schemas/Entry'
+        - type: object
+          properties:
+            solutions:
+              type: array
+              items: { $ref: '#/components/schemas/Solution' }
+            links:
+              type: array
+              items: { $ref: '#/components/schemas/Link' }
+            attachments:
+              type: array
+              items: { $ref: '#/components/schemas/Attachment' }
+            shares:
+              type: array
+              items: { $ref: '#/components/schemas/Share' }
+
+    EntryInput:
+      type: object
+      description: Fields of an entry. On PATCH, absent fields stay unchanged.
+      properties:
+        kind: { type: string, description: "Kind key (default on create: note).", example: problem }
+        space_id: { type: integer, description: 'Space id; on PATCH `0` removes the space.' }
+        title: { type: string, maxLength: 300, description: 'Required on create.' }
+        summary: { type: string }
+        body: { type: string, description: 'Markdown, up to 2 MiB. `[[id]]` links other entries.' }
+        error_text: { type: string, description: 'Verbatim error message or log excerpt (up to 256 KiB).' }
+        status: { type: string, description: 'Must be one of the kind''s statuses; defaults to the first.' }
+        tags:
+          type: array
+          maxItems: 50
+          description: Normalised to lower case; spaces become dashes.
+          items: { type: string }
+        fields:
+          type: object
+          maxProperties: 50
+          description: Free key/value metadata; empty values are dropped. Replaces all fields when given.
+          additionalProperties: { type: string }
+        pinned: { type: boolean }
+        version: { type: integer, description: 'PATCH only — the version you edited; mismatches return 409 version_conflict.' }
+        note: { type: string, description: 'Revision note ("what changed").' }
+
+    CreateEntryInput:
+      allOf:
+        - $ref: '#/components/schemas/EntryInput'
+        - type: object
+          required: [title]
+          properties:
+            solutions:
+              type: array
+              description: Solutions to add right away; entries with empty bodies are skipped.
+              items: { $ref: '#/components/schemas/SolutionInput' }
+            links:
+              type: array
+              items:
+                type: object
+                properties:
+                  to: { type: integer }
+                  rel: { $ref: '#/components/schemas/LinkRel' }
+      example:
+        kind: problem
+        title: "nginx: 413 Request Entity Too Large on uploads"
+        summary: Uploads over 1 MB fail behind the reverse proxy.
+        body: "## Symptoms\n\nUploading a 5 MB image returns **413**.\n\n## Root cause\n\nnginx defaults to `client_max_body_size 1m`."
+        error_text: "413 Request Entity Too Large\nnginx/1.27.2"
+        tags: [nginx, uploads, http]
+        fields: { software: nginx, version: 1.27.2 }
+        solutions:
+          - title: Raise client_max_body_size
+            body: "Set `client_max_body_size 100m;` in the server block and run `nginx -t && systemctl reload nginx`."
+            accepted: true
+
+    SolutionInput:
+      type: object
+      required: [body]
+      properties:
+        title: { type: string, maxLength: 300 }
+        body: { type: string, description: 'Markdown.' }
+        accepted: { type: boolean, default: false }
+
+    Solution:
+      type: object
+      properties:
+        id: { type: integer }
+        entry_id: { type: integer }
+        title: { type: string }
+        body: { type: string }
+        body_html: { type: string }
+        accepted: { type: boolean }
+        works_for: { type: integer, description: 'Number of "worked for me" votes.' }
+        voted: { type: boolean, description: 'The caller voted.' }
+        created_by: { oneOf: [{ $ref: '#/components/schemas/UserRef' }, { type: 'null' }] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    VoteResult:
+      type: object
+      properties:
+        works_for: { type: integer }
+        voted: { type: boolean }
+
+    LinkRel:
+      type: string
+      enum: [related, duplicate-of, caused-by, depends-on, supersedes]
+      default: related
+
+    Link:
+      type: object
+      properties:
+        rel: { type: string, description: 'A LinkRel, or `mentioned-by` for `[[id]]` backlinks.' }
+        direction: { type: string, enum: [outgoing, incoming, mention] }
+        entry: { $ref: '#/components/schemas/Entry' }
+
+    Revision:
+      type: object
+      properties:
+        version: { type: integer }
+        kind: { type: string }
+        space_id: { type: [integer, 'null'] }
+        title: { type: string }
+        summary: { type: string }
+        body: { type: string, description: 'Only when fetching a single revision.' }
+        error_text: { type: string, description: 'Only when fetching a single revision.' }
+        status: { type: string }
+        tags: { type: array, items: { type: string } }
+        fields: { type: object, additionalProperties: { type: string } }
+        note: { type: string }
+        edited_by: { oneOf: [{ $ref: '#/components/schemas/UserRef' }, { type: 'null' }] }
+        edited_at: { type: string, format: date-time }
+
+    Attachment:
+      type: object
+      properties:
+        id: { type: string }
+        entry_id: { type: [integer, 'null'] }
+        filename: { type: string, example: nginx-error.png }
+        content_type: { type: string, example: image/png }
+        size: { type: integer }
+        sha256: { type: string }
+        created_at: { type: string, format: date-time }
+        url: { type: string, example: "/files/3k9…/nginx-error.png" }
+
+    Share:
+      type: object
+      properties:
+        token: { type: string }
+        entry_id: { type: integer }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        views: { type: integer }
+        url: { type: string, example: "https://kb.example.com/s/Zx81…" }
+
+    Space:
+      type: object
+      properties:
+        id: { type: integer }
+        slug: { type: string, example: homelab }
+        name: { type: string, example: Homelab }
+        description: { type: string }
+        icon: { type: string, example: home }
+        color: { type: string, example: '#12a594' }
+        created_at: { type: string, format: date-time }
+        entry_count: { type: integer }
+
+    SpaceInput:
+      type: object
+      properties:
+        slug: { type: string, pattern: '^[a-z0-9][a-z0-9\-]{0,62}$' }
+        name: { type: string, maxLength: 80, example: Homelab }
+        description: { type: string }
+        icon: { type: string }
+        color: { type: string, pattern: '^#[0-9a-fA-F]{6}$' }
+
+    KindField:
+      type: object
+      properties:
+        key: { type: string, example: os }
+        label: { type: string, example: OS / Platform }
+        placeholder: { type: string, example: "Debian 13, Windows 11 …" }
+
+    Kind:
+      type: object
+      properties:
+        key: { type: string, readOnly: true, example: problem }
+        label: { type: string, example: Problem }
+        plural: { type: string, example: Problems }
+        icon: { type: string, example: bug }
+        color: { type: string, example: '#e5484d' }
+        description: { type: string }
+        template: { type: string, description: 'Markdown pre-filled into new entries.' }
+        statuses:
+          type: array
+          description: Allowed statuses, first is the default; empty = no status.
+          items: { type: string }
+          example: [open, investigating, solved, workaround, wontfix]
+        has_solutions: { type: boolean }
+        fields:
+          type: array
+          items: { $ref: '#/components/schemas/KindField' }
+        sort: { type: integer }
+        entry_count: { type: integer, readOnly: true }
+
+    Count:
+      type: object
+      properties:
+        key: { type: string }
+        count: { type: integer }
+
+    Facets:
+      type: object
+      properties:
+        kinds: { type: array, items: { $ref: '#/components/schemas/Count' } }
+        statuses: { type: array, items: { $ref: '#/components/schemas/Count' } }
+        spaces:
+          type: array
+          description: Keys are space ids as strings; "" = no space.
+          items: { $ref: '#/components/schemas/Count' }
+        tags: { type: array, items: { $ref: '#/components/schemas/Count' } }
+
+    SearchResult:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Entry' } }
+        total: { type: integer, example: 1 }
+        limit: { type: integer, example: 25 }
+        offset: { type: integer, example: 0 }
+        facets: { $ref: '#/components/schemas/Facets' }
+
+    APIToken:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        prefix: { type: string, example: fdk_3kq9Xa2b }
+        scopes: { type: array, items: { type: string, enum: [read, write, admin] } }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: [string, 'null'], format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        token: { type: string, description: 'The secret — only in the creation response.' }
+
+    Session:
+      type: object
+      properties:
+        id: { type: string, description: '16-character id.' }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        method: { type: string, enum: [password, passkey, oidc] }
+        user_agent: { type: string }
+        ip: { type: string }
+        current: { type: boolean }
+
+    Passkey:
+      type: object
+      properties:
+        id: { type: string, description: 'base64url credential id.' }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: [string, 'null'], format: date-time }
+
+    WebAuthnOptions:
+      type: object
+      description: "`{publicKey: …}` as defined by WebAuthn; binary values are base64url strings."
+      properties:
+        publicKey: { type: object }
+
+    WebAuthnCredential:
+      type: object
+      description: The PublicKeyCredential returned by the browser, binary values base64url-encoded.
+      properties:
+        id: { type: string }
+        rawId: { type: string }
+        type: { type: string, example: public-key }
+        response: { type: object }
+        clientExtensionResults: { type: object }
+
+    WebhookEvent:
+      type: string
+      enum: ['*', entry.created, entry.updated, entry.deleted, solution.created, solution.accepted]
+
+    Webhook:
+      type: object
+      properties:
+        id: { type: integer }
+        url: { type: string }
+        secret: { type: string, description: 'HMAC-SHA256 signing secret.' }
+        events: { type: array, items: { $ref: '#/components/schemas/WebhookEvent' } }
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        last_status: { type: string, example: entry.created 200 }
+        last_at: { type: [string, 'null'], format: date-time }
+
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        at: { type: string, format: date-time }
+        user: { oneOf: [{ $ref: '#/components/schemas/UserRef' }, { type: 'null' }] }
+        action: { type: string, example: login }
+        target: { type: string }
+        detail: { type: string }
+        ip: { type: string }
+
+    Stats:
+      type: object
+      properties:
+        entries: { type: integer }
+        problems_open: { type: integer, description: 'Entries with status open or investigating.' }
+        problems_solved: { type: integer, description: 'Entries with status solved or workaround.' }
+        solutions: { type: integer }
+        tags: { type: integer }
+        attachments: { type: integer }
+        attachment_bytes: { type: integer }
+        users: { type: integer }
+        trash: { type: integer }
+        activity:
+          type: array
+          description: Edits per day for the last 365 days (key = YYYY-MM-DD).
+          items: { $ref: '#/components/schemas/Count' }
+        edits_this_week: { type: integer }
+        median_days_to_solve: { type: number }
+
+    ExportDocument:
+      type: object
+      required: [format]
+      properties:
+        format: { type: string, enum: [fundus-export/1] }
+        fundus_version: { type: string }
+        exported_at: { type: string, format: date-time }
+        kinds: { type: array, items: { $ref: '#/components/schemas/Kind' } }
+        spaces: { type: array, items: { $ref: '#/components/schemas/Space' } }
+        entries:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer, description: 'Id in the source instance (used to re-map links).' }
+              kind: { type: string }
+              space: { type: string, description: 'Space slug.' }
+              title: { type: string }
+              summary: { type: string }
+              body: { type: string }
+              error_text: { type: string }
+              status: { type: string }
+              tags: { type: array, items: { type: string } }
+              fields: { type: object, additionalProperties: { type: string } }
+              pinned: { type: boolean }
+              author: { type: string }
+              created_at: { type: string, format: date-time }
+              updated_at: { type: string, format: date-time }
+              solutions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    title: { type: string }
+                    body: { type: string }
+                    accepted: { type: boolean }
+                    created_at: { type: string, format: date-time }
+              links:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    to: { type: integer }
+                    rel: { $ref: '#/components/schemas/LinkRel' }
+
+    JSONRPCRequest:
+      type: object
+      required: [jsonrpc, method]
+      properties:
+        jsonrpc: { type: string, enum: ['2.0'] }
+        id: { description: 'Absent for notifications.', oneOf: [{ type: integer }, { type: string }] }
+        method: { type: string, enum: [initialize, ping, tools/list, tools/call] }
+        params: { type: object }
+
+    JSONRPCResponse:
+      type: object
+      properties:
+        jsonrpc: { type: string }
+        id: { oneOf: [{ type: integer }, { type: string }, { type: 'null' }] }
+        result: { type: object }
+        error:
+          type: object
+          properties:
+            code: { type: integer }
+            message: { type: string }

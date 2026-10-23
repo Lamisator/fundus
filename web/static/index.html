@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{SITE}}</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="/static/img/logo.svg?v={{VERSION}}" type="image/svg+xml">
+  <script src="/static/js/theme.js?v={{VERSION}}"></script>
+  <link rel="stylesheet" href="/static/style.css?v={{VERSION}}">
+  <link rel="stylesheet" href="/static/chroma.css?v={{VERSION}}">
+  <link rel="preload" href="/static/fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
+</head>
+<body>
+  <div id="app"><div class="boot"><img src="/static/img/logo.svg?v={{VERSION}}" alt=""></div></div>
+  <div id="toasts" aria-live="polite"></div>
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
