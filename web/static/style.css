@@ -268,6 +268,7 @@ a.tag:hover { color: var(--accent-text); border-color: color-mix(in srgb, var(--
 .status-solved, .status-current { background: var(--success-soft); color: var(--success); }
 .status-workaround { background: color-mix(in srgb, #0aa5c0 13%, transparent); color: #0b8aa3; }
 :root[data-theme="dark"] .status-workaround { color: #4fd0e6; }
+.status-unverified { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent-text); }
 .status-wontfix, .status-outdated { background: var(--surface-3); color: var(--muted); }
 .badge { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; font-size: 11px; font-weight: 700; background: var(--accent-soft); color: var(--accent-text); }
 
