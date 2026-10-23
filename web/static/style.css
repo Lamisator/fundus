@@ -277,7 +277,7 @@ a.tag:hover { color: var(--accent-text); border-color: color-mix(in srgb, var(--
 .card h3, .section-title { margin: 0 0 12px; font-size: 13px; font-weight: 650; color: var(--text-2); display: flex; align-items: center; gap: 8px; }
 .section-title .ic { color: var(--faint); }
 .empty { text-align: center; padding: 48px 20px; color: var(--muted); }
-.empty .ic { width: 34px; height: 34px; color: var(--faint); stroke-width: 1.4; margin-bottom: 8px; }
+.empty > .ic { width: 34px; height: 34px; color: var(--faint); stroke-width: 1.4; margin-bottom: 8px; }
 .empty h3 { margin: 0 0 4px; color: var(--text); font-size: 16px; }
 
 .entry-list { display: flex; flex-direction: column; }
