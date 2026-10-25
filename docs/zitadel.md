@@ -18,7 +18,10 @@ FUNDUS_OIDC_ISSUER=https://auth.example.com          # your Zitadel instance (no
 FUNDUS_OIDC_CLIENT_ID=123456789@fundus
 FUNDUS_OIDC_CLIENT_SECRET=                           # only for "Code" apps
 FUNDUS_OIDC_BUTTON_LABEL=Sign in with Zitadel
+FUNDUS_OIDC_PROMPT=select_account                    # default: show Zitadel's account picker
 ```
+
+`FUNDUS_OIDC_PROMPT` is sent as the OIDC `prompt` parameter. The default `select_account` makes Zitadel show its account picker on every sign-in instead of silently reusing whichever account the browser is already signed in with (annoying when you have accounts in several organisations). `login` forces a fresh sign-in; an empty value lets Zitadel reuse its session.
 
 Restart the stack. The sign-in page now shows the SSO button. Discovery happens lazily, so a Zitadel that is down while Fundus starts does not keep Fundus from booting.
 

@@ -133,7 +133,11 @@ func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
 		oidc.Nonce(flow.Nonce),
 	}
-	if pr := r.URL.Query().Get("prompt"); pr == "login" || pr == "select_account" {
+	pr := s.cfg.OIDC.Prompt
+	if q := r.URL.Query().Get("prompt"); q == "login" || q == "select_account" {
+		pr = q
+	}
+	if pr != "" {
 		opts = append(opts, oauth2.SetAuthURLParam("prompt", pr))
 	}
 	http.Redirect(w, r, s.oauthConfig(r, p).AuthCodeURL(flow.State, opts...), http.StatusFound)

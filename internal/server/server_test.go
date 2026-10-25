@@ -382,6 +382,7 @@ type fakeIdP struct {
 	ui      map[string]any // userinfo
 	nonce   string
 	scopes  string
+	prompt  string
 	exchErr bool
 }
 
@@ -436,7 +437,7 @@ func (p *fakeIdP) login(t *testing.T, e *env, c *client, extra string) *http.Res
 	if q.Get("code_challenge_method") != "S256" || q.Get("state") == "" || q.Get("nonce") == "" {
 		t.Fatalf("authorize URL: %s", loc)
 	}
-	p.nonce, p.scopes = q.Get("nonce"), q.Get("scope")
+	p.nonce, p.scopes, p.prompt = q.Get("nonce"), q.Get("scope"), q.Get("prompt")
 	return c.do("GET", "/auth/oidc/callback?code=good-code&state="+url.QueryEscape(q.Get("state")), "", nil)
 }
 
@@ -446,6 +447,7 @@ func TestOIDC(t *testing.T) {
 		c.OIDC.Issuer, c.OIDC.ClientID = idp.srv.URL, "fundus-client"
 		c.OIDC.RoleClaim = "urn:zitadel:iam:org:project:roles"
 		c.OIDC.AllowedDomain = "example.com"
+		c.OIDC.Prompt = "select_account"
 	})
 	// Zitadel style: profile only in userinfo, roles + org domain in the token.
 	idp.claims = map[string]any{
@@ -459,6 +461,9 @@ func TestOIDC(t *testing.T) {
 	if resp.StatusCode != 302 || resp.Header.Get("Location") != "/e/1" {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("callback: %d %s %s", resp.StatusCode, resp.Header.Get("Location"), b)
+	}
+	if idp.prompt != "select_account" {
+		t.Fatalf("prompt = %q, want select_account (account picker)", idp.prompt)
 	}
 	if !strings.Contains(idp.scopes, "urn:zitadel:iam:org:domain:primary:example.com") || !strings.Contains(idp.scopes, "urn:zitadel:iam:org:project:roles") {
 		t.Fatalf("scopes: %s", idp.scopes)

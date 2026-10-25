@@ -46,6 +46,10 @@ type OIDC struct {
 	// the user's Fundus role is synced from it on each login: a role key
 	// "admin", "editor" or "viewer" (or fundus-admin, ...) wins, highest first.
 	RoleClaim string
+	// Prompt is sent as the OIDC "prompt" parameter. The default
+	// "select_account" makes Zitadel show its account picker instead of
+	// silently reusing whichever account the browser is signed in with.
+	Prompt string
 }
 
 func (o OIDC) Enabled() bool { return o.Issuer != "" && o.ClientID != "" }
@@ -73,6 +77,7 @@ func Load() (Config, error) {
 			DefaultRole:   env("FUNDUS_OIDC_DEFAULT_ROLE", "editor"),
 			AllowedDomain: env("FUNDUS_OIDC_ALLOWED_DOMAIN", ""),
 			RoleClaim:     env("FUNDUS_OIDC_ROLE_CLAIM", ""),
+			Prompt:        strings.TrimSpace(env("FUNDUS_OIDC_PROMPT", "select_account")),
 		},
 	}
 	if c.DatabaseURL == "" {
