@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Allow access · {{.Site}}</title>
+  <link rel="icon" href="/static/img/logo.svg" type="image/svg+xml">
+  <script src="/static/js/theme.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/js/consent.js"></script>
+  <style>
+    .consent-card { max-width: 460px; }
+    .consent-card p { margin: 0 0 14px; }
+    .consent-card .note { font-size: 13px; color: var(--muted); }
+    .consent-card .check { margin: 4px 0 16px; align-items: flex-start; }
+    .consent-card .check input { margin-top: 3px; flex: none; }
+    .consent-actions { display: flex; gap: 10px; margin-top: 18px; }
+    .consent-actions .btn { flex: 1; }
+  </style>
+</head>
+<body>
+  <div class="auth-wrap">
+    {{if .Error}}
+    <div class="card auth-card consent-card">
+      <img class="logo" src="/static/img/logo.svg" alt="">
+      <h1>Can't connect</h1>
+      <p class="sub">{{.Error}}</p>
+      <a class="btn" href="/">Go to {{.Site}}</a>
+    </div>
+    {{else}}
+    <form id="consent" class="card auth-card consent-card" data-params="{{.Params}}">
+      <img class="logo" src="/static/img/logo.svg" alt="">
+      <h1>Allow access?</h1>
+      <p class="sub">“{{.ClientName}}” wants to use {{.Site}} as <b>{{.User}}</b>.</p>
+      <p>With your approval the app can search and read the entries of this knowledge base{{if .WantsWrite}} and, if you allow it below, create and change entries and solutions{{end}}. What it reads is passed on to the app's provider.</p>
+      <p>After your decision you return to <b>{{.RedirectHost}}</b>.</p>
+      {{if .WantsWrite}}<label class="check"><input type="checkbox" name="allow_write" checked> <span>Also allow changes: create and update entries, add solutions</span></label>{{end}}
+      <p class="note">The app chose its name itself. Only allow access if you just set up this connection. You can disconnect the app at any time under Settings › API tokens.</p>
+      <div id="msg"></div>
+      <div class="consent-actions">
+        <button type="button" class="btn" data-approve="0">Deny</button>
+        <button type="submit" class="btn primary" data-approve="1">Allow access</button>
+      </div>
+    </form>
+    {{end}}
+  </div>
+</body>
+</html>

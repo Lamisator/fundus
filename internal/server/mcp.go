@@ -6,6 +6,8 @@ package server
 //
 //	claude mcp add --transport http fundus https://kb.example.com/mcp \
 //	    --header "Authorization: Bearer fdk_..."
+//
+// or, for clients such as ChatGPT that require it, via OAuth (oauth.go).
 
 import (
 	"encoding/json"
@@ -46,8 +48,8 @@ func (s *Server) handleMCPGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	p := who(r)
 	if p == nil {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="fundus"`)
-		apiError(w, http.StatusUnauthorized, "unauthenticated", "send an API token: Authorization: Bearer fdk_...")
+		w.Header().Set("WWW-Authenticate", s.bearerChallenge(r, ""))
+		apiError(w, http.StatusUnauthorized, "unauthenticated", "send an API token (Authorization: Bearer fdk_...) or connect via OAuth")
 		return
 	}
 	var req rpcRequest

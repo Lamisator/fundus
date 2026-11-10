@@ -367,8 +367,11 @@ async function boot() {
 export async function afterLogin(next) {
   state.config = await api('auth/config');
   state.me = await api('me');
+  const target = next && next.startsWith('/') && !next.startsWith('//') && !next.includes('\\') ? next : '/';
+  // server-rendered pages (the OAuth consent page) need a real page load
+  if (target.startsWith('/oauth/')) { location.assign(target); return; }
   await loadTaxonomy();
-  navigate(next && next.startsWith('/') && !next.startsWith('//') ? next : '/', { replace: true });
+  navigate(target, { replace: true });
 }
 
 window.addEventListener('fundus:taxonomy', () => renderSidebar());

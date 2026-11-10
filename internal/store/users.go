@@ -264,8 +264,10 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `DELETE FROM sessions WHERE expires_at < now()`); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(ctx, `DELETE FROM webauthn_sessions WHERE expires_at < now()`)
-	return err
+	if _, err := s.db.Exec(ctx, `DELETE FROM webauthn_sessions WHERE expires_at < now()`); err != nil {
+		return err
+	}
+	return s.cleanupOAuth(ctx)
 }
 
 // ---------------------------------------------------------------- API tokens
@@ -292,7 +294,7 @@ func (s *Store) CreateToken(ctx context.Context, userID int64, name string, scop
 
 func (s *Store) ListTokens(ctx context.Context, userID int64) ([]APIToken, error) {
 	rows, err := s.db.Query(ctx, `SELECT id, name, prefix, scopes, created_at, last_used_at, expires_at
-		FROM api_tokens WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+		FROM api_tokens WHERE user_id = $1 AND oauth_client_id IS NULL ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +311,7 @@ func (s *Store) ListTokens(ctx context.Context, userID int64) ([]APIToken, error
 }
 
 func (s *Store) DeleteToken(ctx context.Context, userID, id int64) error {
-	tag, err := s.db.Exec(ctx, `DELETE FROM api_tokens WHERE id = $1 AND user_id = $2`, id, userID)
+	tag, err := s.db.Exec(ctx, `DELETE FROM api_tokens WHERE id = $1 AND user_id = $2 AND oauth_client_id IS NULL`, id, userID)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}

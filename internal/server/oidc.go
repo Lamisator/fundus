@@ -119,7 +119,7 @@ func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 			flow.LinkUser = me.ID
 		}
 	}
-	if ret := r.URL.Query().Get("return"); strings.HasPrefix(ret, "/") && !strings.HasPrefix(ret, "//") {
+	if ret := r.URL.Query().Get("return"); strings.HasPrefix(ret, "/") && !strings.HasPrefix(ret, "//") && !strings.Contains(ret, "\\") {
 		flow.Return = ret
 	}
 	raw, _ := json.Marshal(flow)

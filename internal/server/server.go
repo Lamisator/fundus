@@ -140,6 +140,8 @@ func (s *Server) routes() {
 	h("PATCH /api/v1/me/passkeys/{id}", s.sessionOnly(s.handleRenamePasskey))
 	h("DELETE /api/v1/me/passkeys/{id}", s.sessionOnly(s.handleDeletePasskey))
 	h("DELETE /api/v1/me/sso", s.sessionOnly(s.handleUnlinkSSO))
+	h("GET /api/v1/me/oauth-apps", s.sessionOnly(s.handleListOAuthApps))
+	h("DELETE /api/v1/me/oauth-apps/{id}", s.sessionOnly(s.handleDeleteOAuthApp))
 
 	// entries
 	h("GET /api/v1/entries", s.reader(s.handleListEntries))
@@ -217,6 +219,16 @@ func (s *Server) routes() {
 	h("POST /mcp", s.handleMCP)
 	h("GET /mcp", s.handleMCPGet)
 
+	// OAuth 2.1 for MCP clients that cannot take a static token (ChatGPT & co.).
+	h("/.well-known/oauth-protected-resource", cors(s.handleOAuthProtectedResource))
+	h("/.well-known/oauth-protected-resource/mcp", cors(s.handleOAuthProtectedResource))
+	h("/.well-known/oauth-authorization-server", cors(s.handleOAuthServerMetadata))
+	h("/oauth/register", cors(s.handleOAuthRegister))
+	h("/oauth/token", cors(s.handleOAuthToken))
+	h("/oauth/revoke", cors(s.handleOAuthRevoke))
+	h("GET /oauth/authorize", s.handleOAuthAuthorizePage)
+	h("POST /oauth/authorize", s.reader(s.handleOAuthAuthorizeDecision))
+
 	// public share pages + API documentation
 	h("GET /s/{token}", s.handleSharePage)
 	h("GET /api/openapi.yaml", s.handleOpenAPIYAML)
@@ -269,14 +281,16 @@ const sessionCookie = "fundus_session"
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p *principal
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		if isOAuthPublic(r.URL.Path) {
+			// OAuth clients authenticate themselves in the handlers.
+		} else if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 			tok := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 			u, scopes, err := s.st.UserForToken(r.Context(), tok)
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				slog.Error("token lookup", "err", err)
 			}
 			if err != nil || u.Disabled {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="fundus"`)
+				w.Header().Set("WWW-Authenticate", s.bearerChallenge(r, "invalid_token"))
 				apiError(w, http.StatusUnauthorized, "invalid_token", "the API token is invalid, expired or revoked")
 				return
 			}

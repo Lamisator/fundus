@@ -141,6 +141,8 @@ tags:
     description: Users, webhooks and the audit log. Admin only.
   - name: Data
     description: Statistics, export and import.
+  - name: OAuth
+    description: OAuth 2.1 authorization server for MCP clients that cannot use a static token (e.g. ChatGPT).
   - name: MCP
     description: Model Context Protocol endpoint for AI assistants.
   - name: System
@@ -1230,6 +1232,45 @@ paths:
         '204': { description: 'Revoked.' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /api/v1/me/oauth-apps:
+    get:
+      tags: [Account]
+      summary: List my connected apps
+      description: Apps (MCP clients such as ChatGPT) that I connected via OAuth and that still hold a valid refresh token. Browser sessions only.
+      operationId: listOAuthApps
+      responses:
+        '200':
+          description: Connected apps.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    client_id: { type: string, example: fdc_a0Ni_X9c5zOdU5Ws6sAjcQ }
+                    client_name: { type: string, example: ChatGPT }
+                    redirect_uri: { type: string, format: uri }
+                    scopes: { type: array, items: { type: string, enum: [read, write] } }
+                    granted_at: { type: string, format: date-time }
+                    last_used_at: { type: [string, 'null'], format: date-time }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/me/oauth-apps/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Account]
+      summary: Disconnect an app
+      description: Deletes all of my access and refresh tokens for this OAuth client.
+      operationId: deleteOAuthApp
+      responses:
+        '204': { description: 'Disconnected.' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /api/v1/me/passkeys:
     get:
       tags: [Account]
@@ -1752,7 +1793,7 @@ paths:
       tags: [MCP]
       summary: MCP JSON-RPC endpoint
       description: |
-        Model Context Protocol over streamable HTTP. Send one JSON-RPC 2.0 message per request: `initialize`, `ping`, `tools/list`, `tools/call`. Notifications (no `id`) are answered with 202. Requires an API token; write tools appear only for tokens with the `write` scope.
+        Model Context Protocol over streamable HTTP. Send one JSON-RPC 2.0 message per request: `initialize`, `ping`, `tools/list`, `tools/call`. Notifications (no `id`) are answered with 202. Requires an API token or an OAuth access token; write tools appear only for tokens with the `write` scope. Without a token the 401 carries `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource"` so OAuth-capable clients can discover the authorization server.
       operationId: mcp
       requestBody:
         required: true
@@ -1781,6 +1822,106 @@ paths:
       operationId: mcpGet
       responses:
         '405': { description: 'Method not allowed.' }
+
+  # ------------------------------------------------------------ OAuth
+  /.well-known/oauth-protected-resource:
+    get:
+      tags: [OAuth]
+      summary: Protected resource metadata (RFC 9728)
+      description: Names `/mcp` as the resource and this instance as its authorization server. Also served at `/.well-known/oauth-protected-resource/mcp`.
+      operationId: oauthProtectedResource
+      security: []
+      responses:
+        '200':
+          description: Metadata.
+          content:
+            application/json:
+              example:
+                resource: https://kb.example.com/mcp
+                authorization_servers: [https://kb.example.com]
+                scopes_supported: [read, write]
+                bearer_methods_supported: [header]
+
+  /.well-known/oauth-authorization-server:
+    get:
+      tags: [OAuth]
+      summary: Authorization server metadata (RFC 8414)
+      operationId: oauthServerMetadata
+      security: []
+      responses:
+        '200':
+          description: Endpoints and capabilities. PKCE with S256 is required; grant types `authorization_code` and `refresh_token`.
+          content:
+            application/json:
+              example:
+                issuer: https://kb.example.com
+                authorization_endpoint: https://kb.example.com/oauth/authorize
+                token_endpoint: https://kb.example.com/oauth/token
+                registration_endpoint: https://kb.example.com/oauth/register
+                revocation_endpoint: https://kb.example.com/oauth/revoke
+                code_challenge_methods_supported: [S256]
+
+  /oauth/register:
+    post:
+      tags: [OAuth]
+      summary: Dynamic client registration (RFC 7591)
+      description: |
+        Open to anyone, like the spec intends: a registered client gets nothing until a signed-in user approves it. Redirect URIs must be https (http only on localhost). Without `token_endpoint_auth_method` the client is confidential (`client_secret_basic`) and receives a secret; `none` registers a public PKCE-only client. Registrations that are never used are deleted after an hour; at most 100 clients exist at a time.
+      operationId: oauthRegister
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example:
+              client_name: ChatGPT
+              redirect_uris: [https://chatgpt.com/connector_platform_oauth_redirect]
+              token_endpoint_auth_method: none
+      responses:
+        '201': { description: 'Registered; `client_id` (and `client_secret` for confidential clients).' }
+        '400': { description: 'invalid_redirect_uri or invalid_client_metadata.' }
+        '429': { description: 'Too many registered clients.' }
+
+  /oauth/authorize:
+    get:
+      tags: [OAuth]
+      summary: Authorization endpoint (consent page)
+      description: |
+        Browser page. Without a session it redirects to the login page and back. Shows which app asks for access and for which account; `write` is only granted if requested, allowed by the user and the user is an editor or admin. On approval the browser returns to `redirect_uri` with `code`, `state` and `iss`. Required parameters: `response_type=code`, `client_id`, `code_challenge`, `code_challenge_method=S256`; optional `redirect_uri`, `state`, `scope` (`read`, `read write`), `resource`.
+      operationId: oauthAuthorize
+      security: []
+      responses:
+        '200': { description: 'Consent page (HTML).' }
+        '302': { description: 'To the login page, or back to the app with an error.' }
+        '400': { description: 'Unknown client or unregistered redirect_uri (error page, no redirect).' }
+
+  /oauth/token:
+    post:
+      tags: [OAuth]
+      summary: Token endpoint
+      description: |
+        `application/x-www-form-urlencoded`. `grant_type=authorization_code` (with `code`, `code_verifier`, `redirect_uri`) or `grant_type=refresh_token` (with `refresh_token`, optional `scope=read` to narrow). Client authentication via HTTP Basic, `client_id`/`client_secret` form fields, or only `client_id` for public clients. Codes are single use and valid for 10 minutes. Access tokens last one hour; refresh tokens 90 days and rotate on every use.
+      operationId: oauthToken
+      security: []
+      responses:
+        '200':
+          description: Tokens.
+          content:
+            application/json:
+              example: { access_token: fdk_…, token_type: Bearer, expires_in: 3600, refresh_token: fdr_…, scope: read write }
+        '400': { description: 'invalid_grant, invalid_request or unsupported_grant_type.' }
+        '401': { description: 'invalid_client.' }
+
+  /oauth/revoke:
+    post:
+      tags: [OAuth]
+      summary: Revoke a token (RFC 7009)
+      description: Form field `token` (access or refresh token) plus client authentication. Always 200, also for unknown tokens.
+      operationId: oauthRevoke
+      security: []
+      responses:
+        '200': { description: 'Revoked (or did not exist).' }
+        '401': { description: 'invalid_client.' }
 
   # ------------------------------------------------------------ system
   /healthz:

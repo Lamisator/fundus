@@ -141,7 +141,7 @@ function guessDevice() {
 
 async function tokens(t) {
   const draw = async (fresh) => {
-    const list = await api('me/tokens');
+    const [list, apps] = await Promise.all([api('me/tokens'), api('me/oauth-apps')]);
     const base = location.origin;
     mount(t, html`
       <section class="settings-section">
@@ -168,6 +168,17 @@ async function tokens(t) {
             <td><button class="btn sm ghost danger" data-del="${k.id}">Revoke</button></td></tr>`)}</tbody></table></div>` : ''}
       </section>
       <section class="settings-section">
+        <h2>Connected apps</h2>
+        <p>Apps such as ChatGPT that you connected by signing in (OAuth) instead of with a token. Add <code>${base}/mcp</code> as an MCP server in the app; it then asks you to approve access here.</p>
+        ${apps.length ? html`<div class="card table-wrap"><table class="table"><thead><tr><th>App</th><th>Returns to</th><th>Scopes</th><th>Last used</th><th></th></tr></thead><tbody>
+          ${apps.map((a) => html`<tr><td><b>${a.client_name}</b><div class="faint small">connected ${fmtDate(a.granted_at)}</div></td>
+            <td class="small mono">${hostOf(a.redirect_uri)}</td>
+            <td>${(a.scopes || []).map((s) => html`<span class="chip" style="margin-right:3px">${s}</span>`)}</td>
+            <td class="small">${a.last_used_at ? ago(a.last_used_at) : html`<span class="faint">never</span>`}</td>
+            <td><button class="btn sm ghost danger" data-app="${a.client_id}">Disconnect</button></td></tr>`)}</tbody></table></div>`
+          : html`<p class="faint small">No apps connected.</p>`}
+      </section>
+      <section class="settings-section">
         <h2>Quick start</h2>
         <p>Document a solved problem from the command line:</p>
         <div class="code-box">curl -X POST ${base}/api/v1/entries \\
@@ -184,6 +195,10 @@ async function tokens(t) {
     if (!(await confirmDialog('Revoke this token? Anything using it stops working immediately.', { ok: 'Revoke', danger: true }))) return;
     try { await api('me/tokens/' + b.dataset.del, { method: 'DELETE' }); draw(); } catch (err) { fail(err); }
   });
+  on(t, 'click', '[data-app]', async (e, b) => {
+    if (!(await confirmDialog('Disconnect this app? It loses access immediately and has to ask again.', { ok: 'Disconnect', danger: true }))) return;
+    try { await api('me/oauth-apps/' + encodeURIComponent(b.dataset.app), { method: 'DELETE' }); draw(); } catch (err) { fail(err); }
+  });
   on(t, 'submit', '#tf', async (e) => {
     e.preventDefault();
     const scopes = ['read'];
@@ -193,6 +208,10 @@ async function tokens(t) {
     catch (err) { fail(err); }
   });
   draw();
+}
+
+function hostOf(u) {
+  try { return new URL(u).host; } catch { return u; }
 }
 
 function appearance(t) {
