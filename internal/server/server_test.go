@@ -348,7 +348,7 @@ func TestMCP(t *testing.T) {
 	}
 	e.must(c.do("POST", "/mcp", e.admin, map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}), 202)
 	tools := rpc("tools/list", nil)["tools"].([]any)
-	if len(tools) != 7 {
+	if len(tools) != 8 {
 		t.Fatalf("tools: %d", len(tools))
 	}
 	text := func(r map[string]any) string { return r["content"].([]any)[0].(map[string]any)["text"].(string) }
@@ -371,6 +371,54 @@ func TestMCP(t *testing.T) {
 		t.Fatalf("update: %v", text(out))
 	}
 	e.must(c.do("POST", "/mcp", "", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 401)
+
+	// record as unverified now, confirm later
+	call := func(name string, args map[string]any) string {
+		return text(rpc("tools/call", map[string]any{"name": name, "arguments": args}))
+	}
+	call("create_entry", map[string]any{"title": "Unverified fix", "status": "unverified"}) // entry 2
+	if out := call("add_solution", map[string]any{"entry_id": 2, "body": "first try", "accepted": false}); !strings.HasPrefix(out, "Added solution 2 ") {
+		t.Fatalf("add_solution: %s", out)
+	}
+	call("add_solution", map[string]any{"entry_id": 2, "body": "second try"}) // solution 3
+	if out := call("get_entry", map[string]any{"id": 2}); !strings.Contains(out, "(solution 2)") || !strings.Contains(out, "status: unverified") {
+		t.Fatalf("get before accept: %s", out)
+	}
+	res := rpc("tools/call", map[string]any{"name": "accept_solution", "arguments": map[string]any{"entry_id": 1, "solution_id": 2}})
+	if res["isError"] != true {
+		t.Fatalf("solution of another entry accepted: %v", res)
+	}
+	if out := call("accept_solution", map[string]any{"entry_id": 2, "solution_id": 2}); !strings.Contains(out, "status: solved") {
+		t.Fatalf("accept: %s", out)
+	}
+	call("accept_solution", map[string]any{"entry_id": 2, "solution_id": 3}) // replaces the accepted one
+	if out := call("get_entry", map[string]any{"id": 2}); !strings.Contains(out, "(solution 3, accepted)") || strings.Contains(out, "(solution 2, accepted)") {
+		t.Fatalf("get after accept: %s", out)
+	}
+
+	// update_entry(status: solved) with exactly one solution accepts it; with several it warns
+	call("create_entry", map[string]any{"title": "One fix", "status": "unverified"}) // entry 3
+	call("add_solution", map[string]any{"entry_id": 3, "body": "the fix"})           // solution 4
+	if out := call("update_entry", map[string]any{"id": 3, "status": "solved"}); !strings.Contains(out, "solution 4 is now marked accepted") {
+		t.Fatalf("auto-accept: %s", out)
+	}
+	call("create_entry", map[string]any{"title": "Two fixes", "status": "unverified"}) // entry 4
+	call("add_solution", map[string]any{"entry_id": 4, "body": "a"})
+	call("add_solution", map[string]any{"entry_id": 4, "body": "b"})
+	if out := call("update_entry", map[string]any{"id": 4, "status": "solved"}); !strings.Contains(out, "none of its solutions (5, 6)") {
+		t.Fatalf("warning: %s", out)
+	}
+
+	// REST: PATCH accepted
+	var sol store.Solution
+	e.decode(c.do("PATCH", "/api/v1/solutions/5", e.admin, map[string]any{"accepted": true}), 200, &sol)
+	if !sol.Accepted {
+		t.Fatalf("PATCH accepted: %+v", sol)
+	}
+	e.decode(c.do("PATCH", "/api/v1/solutions/5", e.admin, map[string]any{"title": "Fix A", "accepted": false}), 200, &sol)
+	if sol.Accepted || sol.Title != "Fix A" {
+		t.Fatalf("PATCH unaccept: %+v", sol)
+	}
 }
 
 // ---------------------------------------------------------------- OIDC

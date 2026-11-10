@@ -119,7 +119,7 @@ claude mcp add --transport http fundus https://kb.example.com/mcp \
   --header "Authorization: Bearer fdk_…"
 ```
 
-Tools: `search_knowledge`, `get_entry`, `find_similar`, `list_taxonomy`. Tokens with the *write* scope also get `create_entry`, `update_entry` and `add_solution`.
+Tools: `search_knowledge`, `get_entry`, `find_similar`, `list_taxonomy`. Tokens with the *write* scope also get `create_entry`, `update_entry`, `add_solution` and `accept_solution` (accept an existing solution by id, e.g. once an `unverified` fix is confirmed; `update_entry` to `solved` accepts the only solution automatically and warns when several are unaccepted).
 
 **OAuth for ChatGPT & co.** Clients that insist on an OAuth sign-in instead of a static token (ChatGPT connectors, MCP Inspector, …) just get the URL `https://kb.example.com/mcp`. Fundus is its own OAuth 2.1 authorization server as the MCP spec describes: the 401 from `/mcp` points to `/.well-known/oauth-protected-resource`, the client registers itself (dynamic client registration), and the user signs in and approves on a consent page (`/oauth/authorize`) with the usual login (passkey, password or SSO). Access tokens act as the approving user, with *read* or (for editors who allow it) *read + write*; they last an hour, refresh tokens 90 days and rotate. Connected apps are listed under **Settings › API tokens**, where they can be disconnected. Behind a reverse proxy set `FUNDUS_BASE_URL` (or forward `X-Forwarded-Proto`/`-Host`), because the issuer and all discovery URLs are derived from it.
 

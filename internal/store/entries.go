@@ -546,7 +546,7 @@ func (s *Store) AcceptSolution(ctx context.Context, entryID, id int64, accept bo
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE entries e SET status = 'solved' FROM kinds k
-			WHERE e.id = $1 AND k.key = e.kind AND e.status IN ('', 'open', 'investigating')
+			WHERE e.id = $1 AND k.key = e.kind AND e.status IN ('', 'open', 'investigating', 'unverified')
 			AND 'solved' = ANY(k.statuses)`, entryID); err != nil {
 			return err
 		}

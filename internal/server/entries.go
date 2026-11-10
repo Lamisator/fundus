@@ -508,9 +508,9 @@ func (s *Server) entryMarkdown(ctx context.Context, r *http.Request, e store.Ent
 		if title == "" {
 			title = "Solution"
 		}
-		mark := ""
+		mark := fmt.Sprintf(" (solution %d)", sol.ID)
 		if sol.Accepted {
-			mark = " ✓"
+			mark = fmt.Sprintf(" ✓ (solution %d, accepted)", sol.ID)
 		}
 		b.WriteString("\n## " + title + mark + "\n\n" + strings.TrimSpace(sol.Body) + "\n")
 	}
@@ -669,8 +669,9 @@ func (s *Server) handleUpdateSolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Title *string `json:"title"`
-		Body  *string `json:"body"`
+		Title    *string `json:"title"`
+		Body     *string `json:"body"`
+		Accepted *bool   `json:"accepted"`
 	}
 	if !readJSON(w, r, &in) {
 		return
@@ -679,13 +680,32 @@ func (s *Server) handleUpdateSolution(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "body must not be empty")
 		return
 	}
-	sol, err := s.st.UpdateSolution(r.Context(), who(r).ID, id, in.Title, in.Body)
+	var sol store.Solution
+	var err error
+	if in.Title != nil || in.Body != nil {
+		sol, err = s.st.UpdateSolution(r.Context(), who(r).ID, id, in.Title, in.Body)
+	} else {
+		sol, err = s.st.GetSolution(r.Context(), who(r).ID, id)
+	}
 	if err != nil {
 		fail(w, err)
 		return
 	}
 	if in.Body != nil {
 		s.claimFiles(r.Context(), sol.EntryID, *in.Body)
+	}
+	if in.Accepted != nil && *in.Accepted != sol.Accepted {
+		if err := s.st.AcceptSolution(r.Context(), sol.EntryID, id, *in.Accepted); err != nil {
+			fail(w, err)
+			return
+		}
+		if *in.Accepted {
+			s.hooks.emit("solution.accepted", map[string]any{"entry_id": sol.EntryID, "solution_id": id})
+		}
+		if sol, err = s.st.GetSolution(r.Context(), who(r).ID, id); err != nil {
+			fail(w, err)
+			return
+		}
 	}
 	sol.BodyHTML = s.render(r.Context(), sol.Body)
 	writeJSON(w, http.StatusOK, sol)

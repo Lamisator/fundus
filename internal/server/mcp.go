@@ -80,7 +80,9 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 			"serverInfo":      map[string]any{"name": "fundus", "title": s.cfg.SiteName, "version": Version},
 			"instructions": "Fundus is a knowledge base, used mostly for IT problems and their solutions. " +
 				"Search it before solving a technical problem from scratch; when you solve something worth remembering, " +
-				"document it with create_entry (kind 'problem' plus a solution) after asking the user.",
+				"document it with create_entry (kind 'problem' plus a solution) after asking the user. " +
+				"A fix that is not confirmed yet goes in with status 'unverified' and add_solution(accepted: false); " +
+				"once the user confirms it, call accept_solution with that solution's id (shown by add_solution and get_entry).",
 		}
 	case "ping":
 		resp.Result = map[string]any{}
@@ -172,38 +174,47 @@ func mcpTools(write bool) []map[string]any {
 				"description": "Change fields of an existing entry. Only the given fields change; body replaces the whole body.",
 				"inputSchema": obj(update, "id")},
 			map[string]any{"name": "add_solution", "title": "Add a solution",
-				"description": "Add a solution (Markdown) to an entry, optionally marking it accepted (which marks a problem solved).",
+				"description": "Add a solution (Markdown) to an entry, optionally marking it accepted (which marks a problem solved). " +
+					"Returns the new solution's id; accept it later with accept_solution.",
 				"inputSchema": obj(map[string]any{
 					"entry_id": prop("integer", "entry id"),
 					"title":    prop("string", "short title of the approach"),
 					"body":     prop("string", "Markdown"),
 					"accepted": prop("boolean", "mark as the accepted solution"),
 				}, "entry_id", "body")},
+			map[string]any{"name": "accept_solution", "title": "Accept a solution",
+				"description": "Mark an existing solution as the accepted one, e.g. once the user confirmed a fix that was recorded as unverified. " +
+					"Sets the problem's status to solved; a previously accepted solution of the entry is unmarked.",
+				"inputSchema": obj(map[string]any{
+					"entry_id":    prop("integer", "entry id"),
+					"solution_id": prop("integer", "solution id (from add_solution or get_entry)"),
+				}, "entry_id", "solution_id")},
 		)
 	}
 	return tools
 }
 
 type toolArgs struct {
-	Query     string            `json:"query"`
-	Kind      string            `json:"kind"`
-	Tag       string            `json:"tag"`
-	Status    string            `json:"status"`
-	Limit     int               `json:"limit"`
-	ID        int64             `json:"id"`
-	EntryID   int64             `json:"entry_id"`
-	Title     *string           `json:"title"`
-	Summary   *string           `json:"summary"`
-	Body      *string           `json:"body"`
-	ErrorText *string           `json:"error_text"`
-	Tags      *[]string         `json:"tags"`
-	Fields    map[string]string `json:"fields"`
-	Space     string            `json:"space"`
-	Solution  string            `json:"solution"`
-	Note      string            `json:"note"`
-	Accepted  bool              `json:"accepted"`
-	KindPtr   *string           `json:"-"`
-	StatusPtr *string           `json:"-"`
+	Query      string            `json:"query"`
+	Kind       string            `json:"kind"`
+	Tag        string            `json:"tag"`
+	Status     string            `json:"status"`
+	Limit      int               `json:"limit"`
+	ID         int64             `json:"id"`
+	EntryID    int64             `json:"entry_id"`
+	SolutionID int64             `json:"solution_id"`
+	Title      *string           `json:"title"`
+	Summary    *string           `json:"summary"`
+	Body       *string           `json:"body"`
+	ErrorText  *string           `json:"error_text"`
+	Tags       *[]string         `json:"tags"`
+	Fields     map[string]string `json:"fields"`
+	Space      string            `json:"space"`
+	Solution   string            `json:"solution"`
+	Note       string            `json:"note"`
+	Accepted   bool              `json:"accepted"`
+	KindPtr    *string           `json:"-"`
+	StatusPtr  *string           `json:"-"`
 }
 
 func (s *Server) callTool(r *http.Request, name string, raw json.RawMessage) (string, error) {
@@ -224,7 +235,7 @@ func (s *Server) callTool(r *http.Request, name string, raw json.RawMessage) (st
 	p := who(r)
 	ctx := r.Context()
 	base := s.baseURL(r)
-	writeTool := name == "create_entry" || name == "update_entry" || name == "add_solution"
+	writeTool := name == "create_entry" || name == "update_entry" || name == "add_solution" || name == "accept_solution"
 	if writeTool && !p.canWrite() {
 		return "", fmt.Errorf("this token is not allowed to write (needs the write scope and an editor role)")
 	}
@@ -398,7 +409,11 @@ func (s *Server) callTool(r *http.Request, name string, raw json.RawMessage) (st
 			return "", err
 		}
 		s.hooks.emit("entry.updated", e)
-		return fmt.Sprintf("Updated entry %d (now version %d): %s/e/%d", e.ID, e.Version, base, e.ID), nil
+		msg := fmt.Sprintf("Updated entry %d (now version %d): %s/e/%d", e.ID, e.Version, base, e.ID)
+		if a.StatusPtr != nil && e.Status == "solved" {
+			msg += s.ensureAccepted(r, e)
+		}
+		return msg, nil
 
 	case "add_solution":
 		e, err := s.st.GetEntry(ctx, p.ID, a.EntryID)
@@ -418,6 +433,23 @@ func (s *Server) callTool(r *http.Request, name string, raw json.RawMessage) (st
 		}
 		s.hooks.emit("solution.created", map[string]any{"entry_id": e.ID, "entry_title": e.Title, "solution": sol})
 		return fmt.Sprintf("Added solution %d to entry %d: %s/e/%d", sol.ID, e.ID, base, e.ID), nil
+
+	case "accept_solution":
+		e, err := s.st.GetEntry(ctx, p.ID, a.EntryID)
+		if err != nil || e.DeletedAt != nil {
+			return "", fmt.Errorf("entry %d not found", a.EntryID)
+		}
+		sol, err := s.st.GetSolution(ctx, p.ID, a.SolutionID)
+		if err != nil || sol.EntryID != e.ID {
+			return "", fmt.Errorf("solution %d not found on entry %d", a.SolutionID, e.ID)
+		}
+		if err := s.st.AcceptSolution(ctx, e.ID, sol.ID, true); err != nil {
+			return "", err
+		}
+		s.st.Audit(ctx, p.ID, "solution.accepted", strconv.FormatInt(e.ID, 10), strconv.FormatInt(sol.ID, 10)+" (MCP)", clientIP(r))
+		s.hooks.emit("solution.accepted", map[string]any{"entry_id": e.ID, "solution_id": sol.ID})
+		e, _ = s.st.GetEntry(ctx, p.ID, e.ID)
+		return fmt.Sprintf("Accepted solution %d on entry %d (status: %s): %s/e/%d", sol.ID, e.ID, orNone(e.Status), base, e.ID), nil
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
 }
@@ -427,4 +459,42 @@ func prefixed(sep, s string) string {
 		return ""
 	}
 	return sep + s
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// ensureAccepted keeps a problem that update_entry set to solved consistent:
+// with exactly one solution and none accepted, that one is accepted;
+// otherwise the result tells the assistant what is missing.
+func (s *Server) ensureAccepted(r *http.Request, e store.Entry) string {
+	ctx := r.Context()
+	sols, err := s.st.ListSolutions(ctx, who(r).ID, e.ID)
+	if err != nil {
+		return ""
+	}
+	var ids []string
+	for _, sol := range sols {
+		if sol.Accepted {
+			return ""
+		}
+		ids = append(ids, strconv.FormatInt(sol.ID, 10))
+	}
+	switch len(sols) {
+	case 0:
+		return "\nNote: the entry is solved but has no solution. Add the fix with add_solution(accepted: true)."
+	case 1:
+		if err := s.st.AcceptSolution(ctx, e.ID, sols[0].ID, true); err != nil {
+			return "\nNote: could not accept solution " + ids[0] + ": " + err.Error()
+		}
+		s.st.Audit(ctx, who(r).ID, "solution.accepted", strconv.FormatInt(e.ID, 10), ids[0]+" (MCP, auto)", clientIP(r))
+		s.hooks.emit("solution.accepted", map[string]any{"entry_id": e.ID, "solution_id": sols[0].ID})
+		return "\nIts only solution " + ids[0] + " is now marked accepted."
+	}
+	return "\nNote: the entry is solved but none of its solutions (" + strings.Join(ids, ", ") +
+		") is accepted. Call accept_solution with the one that fixed it."
 }

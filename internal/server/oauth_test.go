@@ -138,7 +138,7 @@ func TestOAuthFlow(t *testing.T) {
 		} `json:"result"`
 	}
 	e.decode(anon.do("POST", "/mcp", access, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 200, &rpc)
-	if len(rpc.Result.Tools) != 7 {
+	if len(rpc.Result.Tools) != 8 {
 		t.Fatalf("tools = %d", len(rpc.Result.Tools))
 	}
 	// OAuth tokens are not listed as API tokens but as a connected app

@@ -533,7 +533,8 @@ paths:
       - $ref: '#/components/parameters/SolutionId'
     patch:
       tags: [Solutions]
-      summary: Edit a solution
+      summary: Edit or accept a solution
+      description: Only the given fields change. `accepted` true marks this solution accepted (unmarking any other of the entry) and sets an open, investigating or unverified problem to solved, like `PUT …/accept`.
       operationId: updateSolution
       requestBody:
         required: true
@@ -544,6 +545,7 @@ paths:
               properties:
                 title: { type: string }
                 body: { type: string, description: 'Markdown; must not be empty.' }
+                accepted: { type: boolean }
       responses:
         '200':
           description: The updated solution.
